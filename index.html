@@ -136,21 +136,7 @@
   }
   .btn-more:active { opacity: 0.6; }
 
-  .btn-report {
-    background: #007aff; color: white; border: none;
-    border-radius: 14px; width: 100%; height: 52px;
-    font-size: 17px; font-weight: 600; cursor: pointer;
-    margin-bottom: 10px; transition: opacity 0.15s;
-  }
-  .btn-report:active { opacity: 0.8; }
 
-  .btn-import {
-    background: #5856d6; color: white; border: none;
-    border-radius: 14px; width: 100%; height: 52px;
-    font-size: 17px; font-weight: 600; cursor: pointer;
-    margin-bottom: 10px; transition: opacity 0.15s;
-  }
-  .btn-import:active { opacity: 0.8; }
 
   .btn-reset {
     background: #ff3b30; color: white; border: none;
@@ -159,7 +145,6 @@
   }
   .btn-reset:active { opacity: 0.8; }
 
-  #file-input { display: none; }
 </style>
 </head>
 <body>
@@ -267,9 +252,7 @@
   </div>
 </div>
 
-<button class="btn-report" onclick="exportExcel()">📥 엑셀 백업 다운로드</button>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script>
 const NAMES = { pushup: 'Push-ups', crunch: 'Crunch', squat: 'Squat' };
 const NAMES_REVERSE = { 'Push-ups': 'pushup', 'Crunch': 'crunch', 'Squat': 'squat' };
@@ -308,49 +291,89 @@ function todayLogs() {
 
 // 구글 시트 연동 (Apps Script 웹 앱). 시트가 기록의 원본이며, 실패해도 앱 사용에는 영향 없음
 const SHEET_URL = 'https://script.google.com/macros/s/AKfycbwZqDekBXf06h2HfbKvaBRapgoHvWlLUHLZPao-LPynduDMQqUIDscU0deoNTFAYyD4/exec';
+const PENDING_DEL_KEY = 'workout_pending_del';
+const inFlight = new Set();
+const entryKey = l => l.exercise + '|' + l.count + '|' + l.time;
 
+// 전송 성공 여부를 true/false로 돌려줌 (인터넷이 없으면 false)
 function postToSheet(payload) {
   try {
-    fetch(SHEET_URL, { method: 'POST', mode: 'no-cors', body: JSON.stringify(payload) }).catch(() => {});
-  } catch (e) {}
+    return fetch(SHEET_URL, { method: 'POST', mode: 'no-cors', body: JSON.stringify(payload) })
+      .then(() => true).catch(() => false);
+  } catch (e) { return Promise.resolve(false); }
 }
+function markSent(date, entry) {
+  const all = loadAll();
+  const t = (all[date] || []).find(l => l.ts === entry.ts && entryKey(l) === entryKey(entry));
+  if (t) { t.sent = true; saveAll(all); }
+}
+// 기록을 시트로 전송하고, 성공하면 전송 완료 표시를 남김
 function sendToSheet(date, entry) {
-  postToSheet({ date, exercise: NAMES[entry.exercise], count: entry.count, time: entry.time });
+  const k = date + '|' + entryKey(entry) + '|' + entry.ts;
+  if (inFlight.has(k)) return Promise.resolve();
+  inFlight.add(k);
+  return postToSheet({ date, exercise: NAMES[entry.exercise], count: entry.count, time: entry.time })
+    .then(ok => { if (ok) markSent(date, entry); })
+    .finally(() => inFlight.delete(k));
 }
+function loadPendingDeletes() {
+  try { return JSON.parse(localStorage.getItem(PENDING_DEL_KEY) || '[]'); } catch (e) { return []; }
+}
+function savePendingDeletes(a) { localStorage.setItem(PENDING_DEL_KEY, JSON.stringify(a)); }
+// 삭제가 전송에 실패하면 대기열에 두었다가 다음 동기화 때 다시 보냄
 function sendDeleteToSheet(date, entry) {
-  postToSheet({ action: 'delete', date, exercise: NAMES[entry.exercise], count: entry.count, time: entry.time });
+  const payload = { action: 'delete', date, exercise: NAMES[entry.exercise], count: entry.count, time: entry.time };
+  postToSheet(payload).then(ok => {
+    if (!ok) { const q = loadPendingDeletes(); q.push(payload); savePendingDeletes(q); }
+  });
+}
+async function flushPendingDeletes() {
+  const q = loadPendingDeletes();
+  if (!q.length) return;
+  const left = [];
+  for (const p of q) { if (!(await postToSheet(p))) left.push(p); }
+  savePendingDeletes(left);
 }
 
-// 시트의 기록을 불러와 폰 기록과 합침 (시트에 없는 폰 기록은 그대로 둠)
+// 시트의 기록을 불러와 폰 기록과 합치고, 시트에 아직 없는 폰 기록은 시트로 올림
 let lastSync = 0;
 async function syncFromSheet() {
   if (Date.now() - lastSync < 5000) return;
   lastSync = Date.now();
   try {
+    await flushPendingDeletes();
     const res = await fetch(SHEET_URL);
     const rows = await res.json();
     if (!Array.isArray(rows)) return;
-    const key = l => l.exercise + '|' + l.count + '|' + l.time;
     const validDate = d => /^\d{4}-\d{2}-\d{2}$/.test(d);
     const byDate = {};
     rows.forEach(r => {
       if (!validDate(r.date) || !NAMES_REVERSE[r.exercise]) return;
-      (byDate[r.date] = byDate[r.date] || []).push({ exercise: NAMES_REVERSE[r.exercise], count: r.count, time: r.time, ts: 0 });
+      (byDate[r.date] = byDate[r.date] || []).push({ exercise: NAMES_REVERSE[r.exercise], count: r.count, time: r.time, ts: 0, sent: true });
     });
     const local = loadAll();
     Object.keys(local).forEach(d => { if (!validDate(d)) delete local[d]; });
     const merged = {};
+    const uploads = [];
     new Set([...Object.keys(local), ...Object.keys(byDate)]).forEach(date => {
       const sheetArr = byDate[date] || [];
       const localArr = local[date] || [];
-      const sheetKeys = new Set(sheetArr.map(key));
+      const sheetKeys = new Set(sheetArr.map(entryKey));
       const localByKey = {};
-      localArr.forEach(l => { localByKey[key(l)] = l; });
-      const arr = sheetArr.map(e => localByKey[key(e)] || e).concat(localArr.filter(l => !sheetKeys.has(key(l))));
+      localArr.forEach(l => { localByKey[entryKey(l)] = l; });
+      const fromSheet = sheetArr.map(e => {
+        const l = localByKey[entryKey(e)];
+        if (l) { l.sent = true; return l; }
+        return e;
+      });
+      const localOnly = localArr.filter(l => !sheetKeys.has(entryKey(l)));
+      localOnly.forEach(l => { if (!l.sent && l.ts) uploads.push([date, l]); });
+      const arr = fromSheet.concat(localOnly);
       if (arr.length) merged[date] = arr;
     });
     saveAll(merged);
     renderStats(); renderLog(); renderChart();
+    uploads.forEach(([d, l]) => sendToSheet(d, l));
   } catch (e) {}
 }
 
@@ -670,31 +693,6 @@ function resetToday() {
   showAll = false; renderStats(); renderLog(); renderChart();
 }
 
-function exportExcel() {
-  const all = loadAll();
-  if (Object.keys(all).length === 0) { alert('기록이 없습니다.'); return; }
-  const wb = XLSX.utils.book_new();
-  const detailRows = [['날짜', '운동', '횟수', '시간']];
-  Object.keys(all).sort().forEach(date => {
-    (all[date] || []).forEach(l => detailRows.push([date, NAMES[l.exercise], l.count, l.time]));
-  });
-  const wsDetail = XLSX.utils.aoa_to_sheet(detailRows);
-  wsDetail['!cols'] = [{wch:12},{wch:12},{wch:8},{wch:12}];
-  XLSX.utils.book_append_sheet(wb, wsDetail, '상세 기록');
-  const summaryRows = [['날짜', 'Push-ups', 'Crunch', 'Squat', '총합']];
-  Object.keys(all).sort().forEach(date => {
-    const logs = all[date] || [];
-    const pu = logs.filter(l=>l.exercise==='pushup').reduce((s,l)=>s+l.count,0);
-    const su = logs.filter(l=>l.exercise==='crunch').reduce((s,l)=>s+l.count,0);
-    const sq = logs.filter(l=>l.exercise==='squat').reduce((s,l)=>s+l.count,0);
-    summaryRows.push([date, pu, su, sq, pu+su+sq]);
-  });
-  const wsSummary = XLSX.utils.aoa_to_sheet(summaryRows);
-  wsSummary['!cols'] = [{wch:12},{wch:12},{wch:12},{wch:12},{wch:10}];
-  XLSX.utils.book_append_sheet(wb, wsSummary, '일별 요약');
-  XLSX.writeFile(wb, 'workout_backup.xlsx');
-}
-
 document.getElementById('today-date').textContent = fmt(new Date());
 renderStats();
 renderLog();
@@ -705,4 +703,3 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
 </script>
 </body>
 </html>
-
