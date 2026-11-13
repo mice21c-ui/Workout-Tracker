@@ -268,8 +268,6 @@
 </div>
 
 <button class="btn-report" onclick="exportExcel()">📥 엑셀 백업 다운로드</button>
-<button class="btn-import" onclick="document.getElementById('file-input').click()">📤 엑셀 백업 가져오기</button>
-<input type="file" id="file-input" accept=".xlsx" onchange="importExcel(event)">
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script>
@@ -308,15 +306,49 @@ function todayLogs() {
   return (loadAll()[today()] || []);
 }
 
-// 구글 시트 자동 백업 (Apps Script 웹 앱). 실패해도 앱 기록에는 영향 없음
+// 구글 시트 연동 (Apps Script 웹 앱). 시트가 기록의 원본이며, 실패해도 앱 사용에는 영향 없음
 const SHEET_URL = 'https://script.google.com/macros/s/AKfycbwZqDekBXf06h2HfbKvaBRapgoHvWlLUHLZPao-LPynduDMQqUIDscU0deoNTFAYyD4/exec';
-function sendToSheet(date, entry) {
+
+function postToSheet(payload) {
   try {
-    fetch(SHEET_URL, {
-      method: 'POST',
-      mode: 'no-cors',
-      body: JSON.stringify({ date, exercise: NAMES[entry.exercise], count: entry.count, time: entry.time })
-    }).catch(() => {});
+    fetch(SHEET_URL, { method: 'POST', mode: 'no-cors', body: JSON.stringify(payload) }).catch(() => {});
+  } catch (e) {}
+}
+function sendToSheet(date, entry) {
+  postToSheet({ date, exercise: NAMES[entry.exercise], count: entry.count, time: entry.time });
+}
+function sendDeleteToSheet(date, entry) {
+  postToSheet({ action: 'delete', date, exercise: NAMES[entry.exercise], count: entry.count, time: entry.time });
+}
+
+// 시트의 기록을 불러와 폰 기록과 합침 (시트에 없는 폰 기록은 그대로 둠)
+let lastSync = 0;
+async function syncFromSheet() {
+  if (Date.now() - lastSync < 5000) return;
+  lastSync = Date.now();
+  try {
+    const res = await fetch(SHEET_URL);
+    const rows = await res.json();
+    if (!Array.isArray(rows)) return;
+    const key = l => l.exercise + '|' + l.count + '|' + l.time;
+    const byDate = {};
+    rows.forEach(r => {
+      if (!r.date || !NAMES_REVERSE[r.exercise]) return;
+      (byDate[r.date] = byDate[r.date] || []).push({ exercise: NAMES_REVERSE[r.exercise], count: r.count, time: r.time, ts: 0 });
+    });
+    const local = loadAll();
+    const merged = {};
+    new Set([...Object.keys(local), ...Object.keys(byDate)]).forEach(date => {
+      const sheetArr = byDate[date] || [];
+      const localArr = local[date] || [];
+      const sheetKeys = new Set(sheetArr.map(key));
+      const localByKey = {};
+      localArr.forEach(l => { localByKey[key(l)] = l; });
+      const arr = sheetArr.map(e => localByKey[key(e)] || e).concat(localArr.filter(l => !sheetKeys.has(key(l))));
+      if (arr.length) merged[date] = arr;
+    });
+    saveAll(merged);
+    renderStats(); renderLog(); renderChart();
   } catch (e) {}
 }
 
@@ -340,6 +372,7 @@ function deleteLog(index) {
   if (!entry) return;
   if (!confirm(`"${NAMES[entry.exercise]} ${entry.count}개" 기록을 삭제할까요?`)) return;
   all[key].splice(index, 1);
+  sendDeleteToSheet(key, entry);
   if (all[key].length === 0) delete all[key];
   saveAll(all);
   renderStats(); renderLog(); renderChart();
@@ -352,6 +385,7 @@ function deleteLogByDate(date, index) {
   if (!entry) return;
   if (!confirm(`"${NAMES[entry.exercise]} ${entry.count}개" 기록을 삭제할까요?`)) return;
   all[date].splice(index, 1);
+  sendDeleteToSheet(date, entry);
   if (all[date].length === 0) delete all[date];
   saveAll(all);
   renderStats(); renderLog(); renderChart();
@@ -628,7 +662,9 @@ function renderChart() {
 
 function resetToday() {
   if (!confirm('오늘 기록을 초기화할까요?')) return;
-  const all = loadAll(); delete all[today()]; saveAll(all);
+  const all = loadAll();
+  (all[today()] || []).forEach(e => sendDeleteToSheet(today(), e));
+  delete all[today()]; saveAll(all);
   showAll = false; renderStats(); renderLog(); renderChart();
 }
 
@@ -657,43 +693,13 @@ function exportExcel() {
   XLSX.writeFile(wb, 'workout_backup.xlsx');
 }
 
-function importExcel(event) {
-  const file = event.target.files[0]; if (!file) return;
-  const reader = new FileReader();
-  reader.onload = function(e) {
-    try {
-      const wb = XLSX.read(e.target.result, { type: 'binary' });
-      const ws = wb.Sheets['상세 기록'];
-      if (!ws) { alert('올바른 백업 파일이 아닙니다.'); return; }
-      const rows = XLSX.utils.sheet_to_json(ws, { header: 1 }).slice(1).filter(r => r.length >= 3);
-      if (rows.length === 0) { alert('가져올 데이터가 없습니다.'); return; }
-      const existing = loadAll();
-      let importedCount = 0;
-      rows.forEach(row => {
-        const date = String(row[0]||'').trim();
-        const exKey = NAMES_REVERSE[String(row[1]||'').trim()];
-        const count = parseInt(row[2], 10);
-        const time = String(row[3]||'').trim();
-        if (!date || !exKey || isNaN(count)) return;
-        if (!existing[date]) existing[date] = [];
-        const isDup = existing[date].some(l => l.exercise===exKey && l.count===count && l.time===time);
-        if (!isDup) { existing[date].push({ exercise: exKey, count, time, ts: 0 }); importedCount++; }
-      });
-      saveAll(existing);
-      showAll = false; renderStats(); renderLog(); renderChart();
-      alert(`✅ 가져오기 완료!\n${importedCount}개 기록을 복구했습니다.`);
-    } catch(err) { alert('파일을 읽는 중 오류가 발생했습니다.'); }
-    event.target.value = '';
-  };
-  reader.readAsBinaryString(file);
-}
-
 document.getElementById('today-date').textContent = fmt(new Date());
 renderStats();
 renderLog();
 renderChart();
 window.addEventListener('resize', renderChart);
+syncFromSheet();
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') syncFromSheet(); });
 </script>
 </body>
 </html>
-
