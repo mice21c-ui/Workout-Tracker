@@ -308,13 +308,27 @@ function todayLogs() {
   return (loadAll()[today()] || []);
 }
 
+// 구글 시트 자동 백업 (Apps Script 웹 앱). 실패해도 앱 기록에는 영향 없음
+const SHEET_URL = 'https://script.google.com/macros/s/AKfycbwZqDekBXf06h2HfbKvaBRapgoHvWlLUHLZPao-LPynduDMQqUIDscU0deoNTFAYyD4/exec';
+function sendToSheet(date, entry) {
+  try {
+    fetch(SHEET_URL, {
+      method: 'POST',
+      mode: 'no-cors',
+      body: JSON.stringify({ date, exercise: NAMES[entry.exercise], count: entry.count, time: entry.time })
+    }).catch(() => {});
+  } catch (e) {}
+}
+
 function record(ex) {
   const val = parseInt(document.getElementById('val-' + ex).value, 10);
   if (!val || val < 1) { alert('횟수를 1 이상으로 입력해 주세요.'); return; }
   const all = loadAll();
   if (!all[today()]) all[today()] = [];
-  all[today()].push({ exercise: ex, count: val, time: timeStr(), ts: Date.now() });
+  const entry = { exercise: ex, count: val, time: timeStr(), ts: Date.now() };
+  all[today()].push(entry);
   saveAll(all);
+  sendToSheet(today(), entry);
   showAll = false;
   renderStats(); renderLog(); renderChart(); flashCard(ex);
 }
@@ -682,3 +696,4 @@ window.addEventListener('resize', renderChart);
 </script>
 </body>
 </html>
+
